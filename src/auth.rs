@@ -65,6 +65,7 @@ pub struct StoredCredential {
     pub enterprise_url: Option<String>,
 }
 
+#[derive(Debug)]
 pub enum LoginOutcome {
     /// oauth-code / device-code produced a credential to store.
     Credentials(Box<StoredCredential>),
@@ -1424,6 +1425,17 @@ fn uuid() -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn providers_without_a_login_rule_report_it() {
+        let context = LoginContext {
+            profile_dir: Path::new("/tmp"),
+            client_name: "test-client",
+        };
+        let error = login("azure", &context, &|_, _| {}, &|_| {}, None)
+            .expect_err("azure declares no login flow");
+        assert!(error.contains("has no login flow"), "{error}");
+    }
 
     #[test]
     fn template_substitutes_known_and_blank_unknowns() {
