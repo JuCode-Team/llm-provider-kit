@@ -560,14 +560,45 @@ mod tests {
                 let Ok((mut stream, _)) = listener.accept() else {
                     return;
                 };
-                // Drain the request line + headers before answering.
-                let mut buffer = [0_u8; 2048];
-                let _ = stream.read(&mut buffer);
+                // Read the whole request (headers + body) before answering:
+                // closing the socket while the client is still writing makes
+                // ureq report a transport error instead of reading the reply.
+                let _ = read_request(&mut stream);
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.flush();
             }
         });
         format!("http://{addr}")
+    }
+
+    /// Consumes one request off `stream`, body included.
+    fn read_request(stream: &mut std::net::TcpStream) -> std::io::Result<()> {
+        let mut received = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        let (mut header_end, mut content_length) = (None, 0_usize);
+        loop {
+            let read = stream.read(&mut chunk)?;
+            if read == 0 {
+                return Ok(());
+            }
+            received.extend_from_slice(&chunk[..read]);
+            if header_end.is_none() {
+                if let Some(position) = received.windows(4).position(|w| w == b"\r\n\r\n") {
+                    header_end = Some(position + 4);
+                    let headers = String::from_utf8_lossy(&received[..position]).to_lowercase();
+                    content_length = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                }
+            }
+            if let Some(end) = header_end {
+                if received.len() >= end + content_length {
+                    return Ok(());
+                }
+            }
+        }
     }
 
     fn sse_response(body: &str) -> String {
