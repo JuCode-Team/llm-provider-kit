@@ -828,6 +828,73 @@ mod tests {
     }
 
     #[test]
+    fn request_body_carries_system_tools_and_capped_thinking() {
+        let input = vec![json!({
+            "role": "user",
+            "content": [{ "type": "input_text", "text": "hi" }]
+        })];
+        let tools = tool_definitions(&[json!({
+            "name": "read",
+            "description": "read a file",
+            "parameters": { "type": "object" }
+        })]);
+
+        let body = request_body(&AnthropicRequest {
+            model: "claude-opus-4-8",
+            system_prompt: "system",
+            input: &input,
+            tools: &tools,
+            max_output_tokens: 8_192,
+            reasoning_effort: "high",
+        });
+
+        assert_eq!(body["system"], "system");
+        assert_eq!(body["max_tokens"], 8_192);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["tools"][0]["name"], "read");
+        assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+        // 20k would exceed max_tokens, so the budget is capped below it.
+        assert_eq!(body["thinking"]["budget_tokens"], 7_168);
+        assert_eq!(body["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn request_body_omits_thinking_for_efforts_without_a_budget() {
+        let body = request_body(&AnthropicRequest {
+            model: "claude-opus-4-8",
+            system_prompt: "system",
+            input: &[],
+            tools: &[],
+            max_output_tokens: 1_024,
+            reasoning_effort: "none",
+        });
+
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn non_streaming_message_normalizes_usage_and_items() {
+        // Anthropic reports input, cache_read and cache_creation disjointly;
+        // normalized: input = 10 + 90 + 20 = 120, cached = 90.
+        let message = json!({
+            "content": [{ "type": "text", "text": "hello" }],
+            "usage": {
+                "input_tokens": 10,
+                "cache_read_input_tokens": 90,
+                "cache_creation_input_tokens": 20,
+                "output_tokens": 5
+            }
+        });
+
+        let items = message_items(&message);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "message");
+        let usage = message_usage(&message).expect("usage present");
+        assert_eq!((usage.input_tokens, usage.cached_input_tokens), (120, 90));
+        assert_eq!(usage.output_tokens, 5);
+    }
+
+    #[test]
     fn builds_messages_url_for_gateway_and_official_bases() {
         assert_eq!(
             messages_url("https://gateway.example.com"),

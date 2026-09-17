@@ -535,6 +535,51 @@ mod tests {
     }
 
     #[test]
+    fn request_body_sets_output_cap_store_and_reasoning_include() {
+        let body = request_body(ResponsesRequest {
+            model: "gpt-5.5",
+            instructions: "system",
+            prompt_cache_key: "cache-key",
+            reasoning_effort: "medium",
+            input: Vec::new(),
+            tools: &[],
+            max_output_tokens: 2048,
+        });
+
+        assert_eq!(body["max_output_tokens"], 2048);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["include"][0], "reasoning.encrypted_content");
+        assert_eq!(body["prompt_cache_key"], "cache-key");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert_eq!(body["parallel_tool_calls"], true);
+    }
+
+    #[test]
+    fn request_body_drops_the_reasoning_summary_when_effort_is_none() {
+        let body = request_body(ResponsesRequest {
+            model: "gpt-5.5",
+            instructions: "system",
+            prompt_cache_key: "cache-key",
+            reasoning_effort: "none",
+            input: Vec::new(),
+            tools: &[],
+            max_output_tokens: 2048,
+        });
+
+        assert_eq!(body["reasoning"], json!({ "effort": "none" }));
+    }
+
+    #[test]
+    fn one_shot_body_sets_store_false_and_output_cap() {
+        let body = one_shot_body("gpt-5.5", "sys", "low", "user", 2048);
+
+        assert_eq!(body["store"], false);
+        assert_eq!(body["max_output_tokens"], 2048);
+        assert_eq!(body["reasoning"]["effort"], "low");
+        assert_eq!(body["input"][0]["content"][0]["text"], "user");
+    }
+
+    #[test]
     fn urls_place_each_responses_dialect_at_its_own_endpoint() {
         assert_eq!(
             responses_url("https://api.openai.com/v1/"),

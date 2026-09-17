@@ -722,6 +722,120 @@ mod tests {
     }
 
     #[test]
+    fn retry_backoff_increases_and_caps() {
+        assert_eq!(retry_backoff(1), Duration::from_millis(250));
+        assert_eq!(retry_backoff(2), Duration::from_millis(500));
+        assert_eq!(retry_backoff(3), Duration::from_millis(1000));
+        assert_eq!(retry_backoff(5), Duration::from_millis(4000));
+        assert_eq!(retry_backoff(99), Duration::from_millis(4000));
+    }
+
+    #[test]
+    fn stream_decode_errors_are_retryable_but_data_errors_are_not() {
+        assert!(is_stream_decode_error("Error while decoding chunks"));
+        assert!(is_stream_decode_error("connection reset by peer"));
+        assert!(is_stream_decode_error("the operation timed out"));
+        assert!(is_stream_decode_error(
+            "peer closed connection without sending TLS close_notify"
+        ));
+        assert!(is_stream_decode_error(
+            "tls connection init failed: unexpected end of file"
+        ));
+        assert!(is_stream_decode_error(
+            "stream closed before response.completed"
+        ));
+        assert!(!is_stream_decode_error(
+            "{\"type\":\"response.failed\",\"response\":{}}"
+        ));
+        assert!(!is_stream_decode_error("expected value at line 1 column 1"));
+        assert!(!is_retryable_stream_error(
+            r#"{"type":"response.failed","response":{"error":{"code":"invalid_request_error","message":"bad request"}}}"#
+        ));
+    }
+
+    #[test]
+    fn anthropic_transient_stream_errors_are_retryable() {
+        assert!(is_retryable_stream_error(
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#
+        ));
+        assert!(is_retryable_stream_error(
+            r#"{"type":"error","error":{"type":"api_error","message":"Internal server error"}}"#
+        ));
+        assert!(!is_retryable_stream_error(
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad request"}}"#
+        ));
+    }
+
+    /// The parsers' terminal error messages must stay in sync with the retry
+    /// classification: truncated streams are transport failures (safe to
+    /// re-send), while in-stream data errors are not.
+    #[test]
+    fn vendor_stream_errors_classify_as_the_parsers_report_them() {
+        let error = responses::read_sse_stream(
+            "data: {\"type\":\"response.created\"}\n\n".as_bytes(),
+            |_| Ok(()),
+        )
+        .expect_err("stream without response.completed should fail");
+        assert!(error.contains("stream closed before response.completed"));
+        assert!(is_retryable_stream_error(&error));
+
+        let sse = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+        );
+        let error = anthropic::read_sse_stream(sse.as_bytes(), |_| Ok(()))
+            .expect_err("truncated stream should fail");
+        assert!(error.contains("stream closed before message_stop"));
+        assert!(is_retryable_stream_error(&error));
+
+        let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n";
+        let error =
+            chat::read_sse_stream(sse.as_bytes(), |_| Ok(())).expect_err("truncated chat stream");
+        assert!(error.contains("stream closed before finish_reason"));
+        assert!(is_retryable_stream_error(&error));
+
+        let sse =
+            "data: {\"type\":\"error\",\"code\":\"invalid_api_key\",\"message\":\"bad key\"}\n\n";
+        let error = responses::read_sse_stream(sse.as_bytes(), |_| Ok(()))
+            .expect_err("in-stream error event should fail");
+        assert!(error.contains("invalid_api_key"));
+        assert!(!is_retryable_stream_error(&error));
+
+        // A truncated tool call is a data error: retrying would replay the
+        // whole (expensive) response for the same likely outcome.
+        let sse = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"write\",\"input\":{}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"a.txt\\\",\\\"content\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":9}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let error = anthropic::read_sse_stream(sse.as_bytes(), |_| Ok(()))
+            .expect_err("truncated tool_use should fail");
+        assert!(!is_retryable_stream_error(&error));
+    }
+
+    #[test]
+    fn codex_turn_state_is_captured_once() {
+        let turn_state = OnceLock::new();
+        let response: ureq::Response = "HTTP/1.1 200 OK\r\n\
+             x-codex-turn-state: sticky-1\r\n\
+             \r\n"
+            .parse()
+            .unwrap();
+        capture_turn_state(&response, &turn_state);
+        assert_eq!(turn_state.get().map(String::as_str), Some("sticky-1"));
+
+        let response: ureq::Response = "HTTP/1.1 200 OK\r\n\
+             x-codex-turn-state: sticky-2\r\n\
+             \r\n"
+            .parse()
+            .unwrap();
+        capture_turn_state(&response, &turn_state);
+        assert_eq!(turn_state.get().map(String::as_str), Some("sticky-1"));
+    }
+
+    #[test]
     fn endpoint_places_each_dialect_at_its_own_path() {
         assert_eq!(
             endpoint(Protocol::OpenAiResponses, "https://api.openai.com/v1"),
