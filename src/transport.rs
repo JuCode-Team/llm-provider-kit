@@ -73,19 +73,20 @@ pub struct ClientConfig<'a> {
     /// name (the Codex `originator` header).
     pub client_name: &'a str,
     pub connect_timeout: Duration,
-    pub read_timeout: Duration,
     /// Retries after the first attempt (transport errors, 429, 5xx only).
     pub retry_attempts: usize,
     /// Print prompt-cache diagnostics to stderr.
     pub cache_debug: bool,
 }
 
+/// Cloning shares the prompt-cache turn state, so a derived client (a subagent,
+/// say) keeps the session's stickiness while choosing its own timeouts.
+#[derive(Clone)]
 pub struct Client {
     api_key: String,
     prompt_cache_key: String,
     client_name: String,
     connect_timeout: Duration,
-    read_timeout: Duration,
     retry_attempts: usize,
     cache_debug: bool,
     turn_state: Arc<OnceLock<String>>,
@@ -98,7 +99,6 @@ impl Client {
             prompt_cache_key: config.prompt_cache_key.to_string(),
             client_name: config.client_name.to_string(),
             connect_timeout: config.connect_timeout,
-            read_timeout: config.read_timeout,
             retry_attempts: config.retry_attempts,
             cache_debug: config.cache_debug,
             turn_state: Arc::new(OnceLock::new()),
@@ -174,11 +174,12 @@ impl Client {
         protocol: Protocol,
         url: &str,
         body: &Value,
+        read_timeout: Duration,
         emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> Result<ureq::Response, String> {
         let max_attempts = self.max_attempts();
         for attempt in 1..=max_attempts {
-            match self.send(protocol, url, body, self.read_timeout) {
+            match self.send(protocol, url, body, read_timeout) {
                 Ok(response) => return Ok(response),
                 Err(error) if attempt < max_attempts && error.is_retryable() => {
                     emit(StreamEvent::Retrying {
@@ -200,13 +201,14 @@ impl Client {
         protocol: Protocol,
         url: &str,
         body: &Value,
+        read_timeout: Duration,
         emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
     ) -> Result<Vec<Value>, String> {
         let max_attempts = self.max_attempts();
         for attempt in 1..=max_attempts {
             // Single send per attempt: this loop owns all retries, so send and
             // stream failures cannot multiply into nested retry rounds.
-            let response = match self.send(protocol, url, body, self.read_timeout) {
+            let response = match self.send(protocol, url, body, read_timeout) {
                 Ok(response) => response,
                 Err(error) if attempt < max_attempts && error.is_retryable() => {
                     emit(StreamEvent::Retrying {
@@ -544,7 +546,6 @@ mod tests {
             prompt_cache_key: "cache-key",
             client_name: "test-client",
             connect_timeout: Duration::from_secs(2),
-            read_timeout: Duration::from_secs(2),
             retry_attempts: 1,
             cache_debug: false,
         })
@@ -592,6 +593,7 @@ mod tests {
                 Protocol::OpenAiResponses,
                 &format!("{base}/responses"),
                 &serde_json::json!({ "model": "test" }),
+                Duration::from_secs(2),
                 &mut |event| {
                     match event {
                         StreamEvent::Connected => connected += 1,
@@ -627,6 +629,7 @@ mod tests {
                 Protocol::OpenAiResponses,
                 &format!("{base}/responses"),
                 &serde_json::json!({ "model": "test" }),
+                Duration::from_secs(2),
                 &mut |event| {
                     match event {
                         StreamEvent::Retrying { attempt } => {
@@ -659,6 +662,7 @@ mod tests {
                 Protocol::OpenAiResponses,
                 &format!("{base}/responses"),
                 &serde_json::json!({ "model": "test" }),
+                Duration::from_secs(2),
                 &mut |event| {
                     if matches!(event, StreamEvent::Retrying { .. }) {
                         retries += 1;
