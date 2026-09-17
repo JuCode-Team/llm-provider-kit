@@ -8,7 +8,8 @@
 //!
 //! Only the wire dialects this crate speaks are routable; providers whose
 //! models all resolve to unsupported APIs stay visible for BYOK config but
-//! cannot be logged in or picked.
+//! cannot be logged in or picked. The artifact is MIT-licensed upstream data;
+//! see NOTICE for the attribution that ships with it.
 
 use crate::Protocol;
 use serde_json::Value;

@@ -5,6 +5,9 @@
 // The pin lives in scripts/OMP_VERSION: bump it, re-run this script, and commit
 // the regenerated artifact together. Nothing is fetched at runtime.
 //
+// The artifact is MIT-licensed upstream data; see NOTICE for the attribution
+// that has to ship with it.
+//
 // Usage: node scripts/sync-catalog.mjs
 
 import { execFileSync } from "node:child_process";
