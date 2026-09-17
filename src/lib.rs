@@ -1,4 +1,4 @@
-//! Wire protocols, provider catalog, and provider templates for LLM clients.
+//! Wire protocols, provider catalog, provider templates, and provider logins.
 //!
 //! The crate owns the hand-written wire protocols so callers do not accumulate
 //! ad-hoc HTTP clients:
@@ -11,6 +11,12 @@
 //! - [`chat`]: OpenAI Chat Completions API (SSE) — used by OpenAI-compatible
 //!   servers such as Ollama and OpenRouter.
 //!
+//! [`omp`] parses the vendored provider catalog (models, wire dialects,
+//! api-routes) and [`auth`] runs the login flows it declares — OAuth
+//! authorization-code, device-code, and api-key — over the primitives in
+//! [`oauth`]. Credentials are returned to the caller; storing them is the
+//! caller's business.
+//!
 //! Parsers read blocking SSE streams (no async runtime) and emit unified
 //! [`WireEvent`]s plus Responses-style output items, which is the canonical
 //! item format callers store regardless of protocol. HTTP transport, retries,
@@ -19,7 +25,10 @@
 use serde_json::Value;
 
 pub mod anthropic;
+pub mod auth;
 pub mod chat;
+mod jwt;
+pub mod oauth;
 pub mod omp;
 pub mod providers;
 pub mod responses;

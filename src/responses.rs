@@ -26,6 +26,18 @@ pub fn azure_responses_url(base_url: &str, api_version: &str) -> String {
     )
 }
 
+/// `chatgpt-account-id` for the Codex backend: the ChatGPT workspace the token
+/// draws its limits from rides in the access token's `https://api.openai.com/auth`
+/// claim.
+pub fn codex_account_id(access_token: &str) -> Option<String> {
+    crate::jwt::decode_jwt_payload(access_token)?
+        .get("https://api.openai.com/auth")?
+        .get("chatgpt_account_id")?
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
 /// Parses a Responses SSE stream, emitting deltas/items/usage as [`WireEvent`]s
 /// and returning the completed output items. Errors if the stream ends before
 /// `response.completed` (or `response.incomplete`).
@@ -477,5 +489,15 @@ mod tests {
             azure_responses_url("https://res.openai.azure.com/openai/v1", "v1"),
             "https://res.openai.azure.com/openai/v1/responses?api-version=v1"
         );
+    }
+
+    #[test]
+    fn codex_account_id_reads_the_chatgpt_workspace_claim() {
+        // {"https://api.openai.com/auth":{"chatgpt_account_id":"acct_1"}}
+        let claims =
+            "eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF8xIn19";
+        let token = format!("header.{claims}.signature");
+        assert_eq!(codex_account_id(&token), Some("acct_1".to_string()));
+        assert_eq!(codex_account_id("not-a-jwt"), None);
     }
 }

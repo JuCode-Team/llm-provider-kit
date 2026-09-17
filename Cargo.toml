@@ -2,7 +2,11 @@
 name = "llm-provider-kit"
 version = "0.1.0"
 edition = "2021"
-description = "Multi-provider LLM wire protocols, provider catalog, and provider templates"
+description = "Multi-provider LLM wire protocols, provider catalog, provider templates, and provider logins"
 
 [dependencies]
+base64 = "0.22"
+getrandom = "0.2"
 serde_json = "1"
+sha2 = "0.10"
+ureq = { version = "2", features = ["json"] }
