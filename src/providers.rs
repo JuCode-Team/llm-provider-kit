@@ -34,7 +34,8 @@ const CODEX_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
 const NO_EFFORTS: &[&str] = &["none"];
 
 /// The gpt-5 family served by official OpenAI and Responses-speaking gateways.
-const GPT_MODELS: &[ModelTemplate] = &[
+/// Public so a caller fronting its own gateway can reuse the table verbatim.
+pub const GPT_MODELS: &[ModelTemplate] = &[
     ModelTemplate {
         name: "gpt-5.5",
         context_window: 272_000,
