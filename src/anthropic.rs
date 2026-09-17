@@ -30,6 +30,81 @@ pub fn is_official_url(url: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
+/// One streaming Messages request, built from Responses-style input items.
+pub struct AnthropicRequest<'a> {
+    pub model: &'a str,
+    pub system_prompt: &'a str,
+    pub input: &'a [Value],
+    /// Tool declarations in [`tool_definitions`] form.
+    pub tools: &'a [Value],
+    pub max_output_tokens: u64,
+    pub reasoning_effort: &'a str,
+}
+
+/// Builds a streaming Messages body. Extended thinking is enabled when the
+/// effort maps to a budget, capped so it stays below `max_tokens`.
+pub fn request_body(request: &AnthropicRequest<'_>) -> Value {
+    let thinking_budget = thinking_budget(request.reasoning_effort)
+        .map(|budget| budget.min(request.max_output_tokens.saturating_sub(1024).max(1024)));
+    let mut body = json!({
+        "model": request.model,
+        "system": request.system_prompt,
+        "max_tokens": request.max_output_tokens.max(1),
+        "messages": input_to_messages(request.input, thinking_budget.is_some()),
+        "tools": request.tools,
+        "tool_choice": { "type": "auto" },
+        "stream": true
+    });
+    if let Some(budget) = thinking_budget {
+        body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+    }
+    body
+}
+
+/// Anthropic tool declarations from Responses-style tool definitions.
+pub fn tool_definitions(definitions: &[Value]) -> Vec<Value> {
+    definitions
+        .iter()
+        .filter_map(|definition| {
+            let name = definition.get("name")?.clone();
+            let mut tool = json!({
+                "name": name,
+                "input_schema": definition.get("parameters").cloned().unwrap_or_else(|| json!({ "type": "object" })),
+            });
+            if let Some(description) = definition.get("description") {
+                tool["description"] = description.clone();
+            }
+            Some(tool)
+        })
+        .collect()
+}
+
+/// Output items of a non-streaming Messages response.
+pub fn message_items(message: &Value) -> Vec<Value> {
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(content_block_to_response_item)
+        .collect()
+}
+
+/// Usage of a non-streaming Messages response, in OpenAI subset semantics.
+pub fn message_usage(message: &Value) -> Option<crate::Usage> {
+    let usage = message.get("usage")?;
+    let (input_tokens, cached_input_tokens) = normalize_usage(Some(usage));
+    Some(crate::Usage {
+        input_tokens,
+        cached_input_tokens,
+        output_tokens: usage
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        reasoning_tokens: 0,
+    })
+}
+
 /// Maps a reasoning effort to an Anthropic extended-thinking token budget.
 /// Returns None when reasoning should be disabled.
 pub fn thinking_budget(effort: &str) -> Option<u64> {

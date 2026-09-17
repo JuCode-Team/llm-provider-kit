@@ -3,7 +3,7 @@
 //! no conversion happens on the way out.
 
 use crate::{normalized_arguments, read_sse_data, Usage, WireEvent};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 /// Responses endpoint for a base URL that mounts the API at its root
@@ -24,6 +24,65 @@ pub fn azure_responses_url(base_url: &str, api_version: &str) -> String {
         "{}/responses?api-version={api_version}",
         base_url.trim_end_matches('/')
     )
+}
+
+/// One streaming Responses request.
+pub struct ResponsesRequest<'a> {
+    pub model: &'a str,
+    pub instructions: &'a str,
+    pub prompt_cache_key: &'a str,
+    pub reasoning_effort: &'a str,
+    /// Conversation items in canonical Responses form.
+    pub input: Vec<Value>,
+    /// Tool declarations in OpenAI function-tool form.
+    pub tools: &'a [Value],
+    pub max_output_tokens: u64,
+}
+
+/// Builds a streaming Responses body. Encrypted reasoning is requested so
+/// multi-turn tool calls can replay it under `store: false`.
+pub fn request_body(request: ResponsesRequest<'_>) -> Value {
+    // A reasoning summary makes the thinking phase stream visible; with effort
+    // "none" the model does not reason, so none is requested.
+    let reasoning = if request.reasoning_effort == "none" {
+        json!({ "effort": request.reasoning_effort })
+    } else {
+        json!({ "effort": request.reasoning_effort, "summary": "auto" })
+    };
+    json!({
+        "model": request.model,
+        "instructions": request.instructions,
+        "prompt_cache_key": request.prompt_cache_key,
+        "reasoning": reasoning,
+        "input": sanitize_input(request.input),
+        "tools": request.tools,
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "max_output_tokens": request.max_output_tokens.max(1),
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
+        "stream": true
+    })
+}
+
+/// Body for a one-shot call (summarization, safety classification): no tools,
+/// no cache key, and no reasoning summary.
+pub fn one_shot_body(
+    model: &str,
+    instructions: &str,
+    reasoning_effort: &str,
+    user: &str,
+    max_output_tokens: u64,
+) -> Value {
+    json!({
+        "model": model,
+        "instructions": instructions,
+        "reasoning": { "effort": reasoning_effort },
+        "max_output_tokens": max_output_tokens.max(1),
+        "input": [{ "role": "user", "content": [{ "type": "input_text", "text": user }] }],
+        "store": false,
+        "stream": true
+    })
 }
 
 /// `chatgpt-account-id` for the Codex backend: the ChatGPT workspace the token

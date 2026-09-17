@@ -15,12 +15,14 @@
 //! api-routes) and [`auth`] runs the login flows it declares — OAuth
 //! authorization-code, device-code, and api-key — over the primitives in
 //! [`oauth`]. Credentials are returned to the caller; storing them is the
-//! caller's business.
+//! caller's business. [`transport`] sends one request at a time over blocking
+//! HTTP (ureq + threads), retries transient failures, and decodes the response
+//! into unified [`WireEvent`]s.
 //!
 //! Parsers read blocking SSE streams (no async runtime) and emit unified
 //! [`WireEvent`]s plus Responses-style output items, which is the canonical
-//! item format callers store regardless of protocol. HTTP transport, retries,
-//! and tool execution stay with the caller.
+//! item format callers store regardless of protocol. Tool execution, approvals,
+//! and the agent loop stay with the caller.
 
 use serde_json::Value;
 
@@ -32,6 +34,7 @@ pub mod oauth;
 pub mod omp;
 pub mod providers;
 pub mod responses;
+pub mod transport;
 
 pub use providers::{templates, ModelTemplate, ProviderTemplate};
 
