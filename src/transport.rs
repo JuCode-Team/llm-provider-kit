@@ -9,6 +9,7 @@
 use crate::{anthropic, chat, responses, Protocol, Usage, WireEvent};
 use serde_json::Value;
 use std::{
+    collections::HashMap,
     env,
     sync::{Arc, OnceLock},
     thread,
@@ -77,6 +78,9 @@ pub struct ClientConfig<'a> {
     pub retry_attempts: usize,
     /// Print prompt-cache diagnostics to stderr.
     pub cache_debug: bool,
+    /// Extra headers per model name, added to requests whose body `model`
+    /// matches — e.g. a gateway's routing header for the chosen group.
+    pub model_headers: HashMap<String, Vec<(String, String)>>,
 }
 
 /// Cloning shares the prompt-cache turn state, so a derived client (a subagent,
@@ -89,6 +93,7 @@ pub struct Client {
     connect_timeout: Duration,
     retry_attempts: usize,
     cache_debug: bool,
+    model_headers: Arc<HashMap<String, Vec<(String, String)>>>,
     turn_state: Arc<OnceLock<String>>,
 }
 
@@ -101,6 +106,7 @@ impl Client {
             connect_timeout: config.connect_timeout,
             retry_attempts: config.retry_attempts,
             cache_debug: config.cache_debug,
+            model_headers: Arc::new(config.model_headers),
             turn_state: Arc::new(OnceLock::new()),
         }
     }
@@ -146,6 +152,10 @@ impl Client {
             if let Some(account_id) = responses::codex_account_id(&self.api_key) {
                 request = request.set("chatgpt-account-id", &account_id);
             }
+        }
+        let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+        for (name, value) in self.model_headers.get(model).into_iter().flatten() {
+            request = request.set(name, value);
         }
         if let Some(turn_state) = self.turn_state.get() {
             request = request.set(X_CODEX_TURN_STATE_HEADER, turn_state);
@@ -540,15 +550,20 @@ mod tests {
         thread,
     };
 
-    fn test_client() -> Client {
-        Client::new(ClientConfig {
+    fn test_config() -> ClientConfig<'static> {
+        ClientConfig {
             api_key: "test-key",
             prompt_cache_key: "cache-key",
             client_name: "test-client",
             connect_timeout: Duration::from_secs(2),
             retry_attempts: 1,
             cache_debug: false,
-        })
+            model_headers: HashMap::new(),
+        }
+    }
+
+    fn test_client() -> Client {
+        Client::new(test_config())
     }
 
     /// Serves `responses` in order, one per accepted connection.
@@ -571,15 +586,15 @@ mod tests {
         format!("http://{addr}")
     }
 
-    /// Consumes one request off `stream`, body included.
-    fn read_request(stream: &mut std::net::TcpStream) -> std::io::Result<()> {
+    /// Consumes one request off `stream`, body included, and returns it.
+    fn read_request(stream: &mut std::net::TcpStream) -> std::io::Result<Vec<u8>> {
         let mut received = Vec::new();
         let mut chunk = [0_u8; 1024];
         let (mut header_end, mut content_length) = (None, 0_usize);
         loop {
             let read = stream.read(&mut chunk)?;
             if read == 0 {
-                return Ok(());
+                return Ok(received);
             }
             received.extend_from_slice(&chunk[..read]);
             if header_end.is_none() {
@@ -595,7 +610,7 @@ mod tests {
             }
             if let Some(end) = header_end {
                 if received.len() >= end + content_length {
-                    return Ok(());
+                    return Ok(received);
                 }
             }
         }
@@ -639,6 +654,40 @@ mod tests {
         assert_eq!(connected, 1);
         assert_eq!(deltas, vec!["hi".to_string()]);
         assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn model_headers_go_only_with_their_model() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let request = read_request(&mut stream).unwrap_or_default();
+                let _ = tx.send(String::from_utf8_lossy(&request).to_lowercase());
+                let _ = stream.write_all(sse_response("").as_bytes());
+            }
+        });
+        let client = Client::new(ClientConfig {
+            model_headers: HashMap::from([(
+                "grouped".to_string(),
+                vec![("X-JuCode-Group".to_string(), "g1".to_string())],
+            )]),
+            ..test_config()
+        });
+        for model in ["grouped", "other"] {
+            let _ = client.send(
+                Protocol::OpenAiResponses,
+                &format!("{base}/responses"),
+                &serde_json::json!({ "model": model }),
+                Duration::from_secs(2),
+            );
+        }
+        assert!(rx.recv().expect("first").contains("x-jucode-group: g1"));
+        assert!(!rx.recv().expect("second").contains("x-jucode-group"));
     }
 
     #[test]
