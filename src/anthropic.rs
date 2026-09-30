@@ -41,24 +41,76 @@ pub struct AnthropicRequest<'a> {
     pub reasoning_effort: &'a str,
 }
 
-/// Builds a streaming Messages body. Extended thinking is enabled when the
-/// effort maps to a budget, capped so it stays below `max_tokens`.
+/// Builds a streaming Messages body. Current Claude models (4.6 and later,
+/// Fable, Mythos) think adaptively with `output_config.effort`; a fixed
+/// `budget_tokens` is rejected there with a 400. Older models get a budget,
+/// capped so it stays below `max_tokens`.
 pub fn request_body(request: &AnthropicRequest<'_>) -> Value {
-    let thinking_budget = thinking_budget(request.reasoning_effort)
-        .map(|budget| budget.min(request.max_output_tokens.saturating_sub(1024).max(1024)));
+    let effort = request.reasoning_effort;
+    let adaptive = uses_adaptive_thinking(request.model);
+    let thinking_budget = if adaptive {
+        None
+    } else {
+        thinking_budget(effort)
+            .map(|budget| budget.min(request.max_output_tokens.saturating_sub(1024).max(1024)))
+    };
+    let thinks = if adaptive {
+        ADAPTIVE_EFFORTS.contains(&effort)
+    } else {
+        thinking_budget.is_some()
+    };
     let mut body = json!({
         "model": request.model,
         "system": request.system_prompt,
         "max_tokens": request.max_output_tokens.max(1),
-        "messages": input_to_messages(request.input, thinking_budget.is_some()),
+        "messages": input_to_messages(request.input, thinks),
         "tools": request.tools,
         "tool_choice": { "type": "auto" },
         "stream": true
     });
-    if let Some(budget) = thinking_budget {
+    if adaptive {
+        if thinks {
+            body["thinking"] = json!({ "type": "adaptive" });
+            body["output_config"] = json!({ "effort": effort });
+        } else {
+            // "none": the lowest effort. Leaving `thinking` out is the one
+            // setting every current model accepts (some cannot turn it off).
+            body["output_config"] = json!({ "effort": "low" });
+        }
+    } else if let Some(budget) = thinking_budget {
         body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
     }
     body
+}
+
+/// Effort levels of adaptive thinking (`output_config.effort`).
+pub const ADAPTIVE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// True for Claude models that take adaptive thinking instead of a thinking
+/// budget: Fable and Mythos, and Opus/Sonnet from 4.6 on. Haiku and older
+/// Opus/Sonnet keep `budget_tokens`.
+pub fn uses_adaptive_thinking(model: &str) -> bool {
+    let name = model.rsplit('/').next().unwrap_or(model);
+    let Some(rest) = name.strip_prefix("claude-") else {
+        return false;
+    };
+    if rest.starts_with("fable") || rest.starts_with("mythos") {
+        return true;
+    }
+    let version = match rest.split_once('-') {
+        Some(("opus" | "sonnet", version)) => version,
+        _ => return false,
+    };
+    // "4-8", "5-5", "5", "4-5-20251101": major, then a minor unless the next
+    // part is a date.
+    let mut parts = version.split('-').map(|part| part.parse::<u32>().ok());
+    let major = parts.next().flatten().unwrap_or(0);
+    let minor = parts
+        .next()
+        .flatten()
+        .filter(|minor| *minor < 100)
+        .unwrap_or(0);
+    (major, minor) >= (4, 6)
 }
 
 /// Anthropic tool declarations from Responses-style tool definitions.
@@ -840,7 +892,7 @@ mod tests {
         })]);
 
         let body = request_body(&AnthropicRequest {
-            model: "claude-opus-4-8",
+            model: "claude-sonnet-4-5",
             system_prompt: "system",
             input: &input,
             tools: &tools,
@@ -859,9 +911,52 @@ mod tests {
     }
 
     #[test]
+    fn current_models_think_adaptively_with_an_effort() {
+        for model in [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-fable-5-1",
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+        ] {
+            let body = request_body(&AnthropicRequest {
+                model,
+                system_prompt: "system",
+                input: &[],
+                tools: &[],
+                max_output_tokens: 32_000,
+                reasoning_effort: "medium",
+            });
+            assert_eq!(body["thinking"], json!({ "type": "adaptive" }), "{model}");
+            assert_eq!(body["output_config"]["effort"], "medium", "{model}");
+        }
+        let none = request_body(&AnthropicRequest {
+            model: "claude-opus-5-5",
+            system_prompt: "system",
+            input: &[],
+            tools: &[],
+            max_output_tokens: 32_000,
+            reasoning_effort: "none",
+        });
+        assert!(none.get("thinking").is_none());
+        assert_eq!(none["output_config"]["effort"], "low");
+    }
+
+    #[test]
+    fn adaptive_thinking_starts_at_opus_and_sonnet_4_6() {
+        assert!(uses_adaptive_thinking("claude-opus-4-6"));
+        assert!(uses_adaptive_thinking("claude-sonnet-5"));
+        assert!(uses_adaptive_thinking("anthropic/claude-mythos-5-1"));
+        assert!(!uses_adaptive_thinking("claude-opus-4-5-20251101"));
+        assert!(!uses_adaptive_thinking("claude-sonnet-4-5"));
+        assert!(!uses_adaptive_thinking("claude-haiku-4-5"));
+        assert!(!uses_adaptive_thinking("gpt-5.5"));
+    }
+
+    #[test]
     fn request_body_omits_thinking_for_efforts_without_a_budget() {
         let body = request_body(&AnthropicRequest {
-            model: "claude-opus-4-8",
+            model: "claude-haiku-4-5",
             system_prompt: "system",
             input: &[],
             tools: &[],
