@@ -61,9 +61,9 @@ pub fn request_body(request: &AnthropicRequest<'_>) -> Value {
     };
     let mut body = json!({
         "model": request.model,
-        "system": request.system_prompt,
+        "system": system,
         "max_tokens": request.max_output_tokens.max(1),
-        "messages": input_to_messages(request.input, thinks),
+        "messages": messages,
         "tools": request.tools,
         "tool_choice": { "type": "auto" },
         "stream": true
@@ -74,6 +74,15 @@ pub fn request_body(request: &AnthropicRequest<'_>) -> Value {
             body["output_config"] = json!({ "effort": effort });
         } else {
             // "none": the lowest effort. Leaving `thinking` out is the one
+    let mut messages = input_to_messages(request.input, thinks);
+    mark_cache_breakpoint(&mut messages);
+    // An empty text block is rejected, so only a non-empty system prompt
+    // carries a breakpoint.
+    let system = if request.system_prompt.is_empty() {
+        json!("")
+    } else {
+        json!([{ "type": "text", "text": request.system_prompt, "cache_control": { "type": "ephemeral" } }])
+    };
             // setting every current model accepts (some cannot turn it off).
             body["output_config"] = json!({ "effort": "low" });
         }
@@ -98,6 +107,28 @@ pub fn uses_adaptive_thinking(model: &str) -> bool {
         return true;
     }
     let version = match rest.split_once('-') {
+/// Prompt-cache breakpoint on the last block of the conversation, so each
+/// request writes the cache the next one reads (the system prompt carries the
+/// other breakpoint). Some gateways cache only marked prompts. Thinking blocks
+/// cannot carry one.
+fn mark_cache_breakpoint(messages: &mut [Value]) {
+    let block = messages
+        .last_mut()
+        .and_then(|message| message.get_mut("content"))
+        .and_then(Value::as_array_mut)
+        .and_then(|blocks| {
+            blocks.iter_mut().rev().find(|block| {
+                !matches!(
+                    block.get("type").and_then(Value::as_str),
+                    Some("thinking" | "redacted_thinking")
+                )
+            })
+        });
+    if let Some(block) = block {
+        block["cache_control"] = json!({ "type": "ephemeral" });
+    }
+}
+
         Some(("opus" | "sonnet", version)) => version,
         _ => return false,
     };
@@ -900,7 +931,12 @@ mod tests {
             reasoning_effort: "high",
         });
 
-        assert_eq!(body["system"], "system");
+        assert_eq!(body["system"][0]["text"], "system");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
         assert_eq!(body["max_tokens"], 8_192);
         assert_eq!(body["stream"], true);
         assert_eq!(body["tools"][0]["name"], "read");
