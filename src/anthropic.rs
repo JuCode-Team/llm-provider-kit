@@ -9,6 +9,20 @@ use std::collections::{BTreeMap, HashSet};
 /// Version header required on Anthropic Messages requests.
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 
+/// `max_tokens` sent when the caller has no cap for the model (0). The
+/// Messages API requires the field, so this is the one value that cannot be
+/// left out; 32K leaves room for the thinking budgets of every effort tier.
+pub const DEFAULT_MAX_TOKENS: u64 = 32_000;
+
+/// The caller's output cap, or `DEFAULT_MAX_TOKENS` when it has none.
+pub fn max_tokens_or_default(max_output_tokens: u64) -> u64 {
+    if max_output_tokens > 0 {
+        max_output_tokens
+    } else {
+        DEFAULT_MAX_TOKENS
+    }
+}
+
 /// Resolves the Messages endpoint from the configured base URL. A base that
 /// already ends in `/v1` (any host) or targets the official Anthropic host
 /// gets the plain `/v1/messages` path; other bases are treated as gateways
@@ -47,22 +61,32 @@ pub struct AnthropicRequest<'a> {
 /// capped so it stays below `max_tokens`.
 pub fn request_body(request: &AnthropicRequest<'_>) -> Value {
     let effort = request.reasoning_effort;
+    let max_tokens = max_tokens_or_default(request.max_output_tokens);
     let adaptive = uses_adaptive_thinking(request.model);
     let thinking_budget = if adaptive {
         None
     } else {
         thinking_budget(effort)
-            .map(|budget| budget.min(request.max_output_tokens.saturating_sub(1024).max(1024)))
+            .map(|budget| budget.min(max_tokens.saturating_sub(1024).max(1024)))
     };
     let thinks = if adaptive {
         ADAPTIVE_EFFORTS.contains(&effort)
     } else {
         thinking_budget.is_some()
     };
+    let mut messages = input_to_messages(request.input, thinks);
+    mark_cache_breakpoint(&mut messages);
+    // An empty text block is rejected, so only a non-empty system prompt
+    // carries a breakpoint.
+    let system = if request.system_prompt.is_empty() {
+        json!("")
+    } else {
+        json!([{ "type": "text", "text": request.system_prompt, "cache_control": { "type": "ephemeral" } }])
+    };
     let mut body = json!({
         "model": request.model,
         "system": system,
-        "max_tokens": request.max_output_tokens.max(1),
+        "max_tokens": max_tokens,
         "messages": messages,
         "tools": request.tools,
         "tool_choice": { "type": "auto" },
@@ -74,15 +98,6 @@ pub fn request_body(request: &AnthropicRequest<'_>) -> Value {
             body["output_config"] = json!({ "effort": effort });
         } else {
             // "none": the lowest effort. Leaving `thinking` out is the one
-    let mut messages = input_to_messages(request.input, thinks);
-    mark_cache_breakpoint(&mut messages);
-    // An empty text block is rejected, so only a non-empty system prompt
-    // carries a breakpoint.
-    let system = if request.system_prompt.is_empty() {
-        json!("")
-    } else {
-        json!([{ "type": "text", "text": request.system_prompt, "cache_control": { "type": "ephemeral" } }])
-    };
             // setting every current model accepts (some cannot turn it off).
             body["output_config"] = json!({ "effort": "low" });
         }
@@ -92,21 +107,6 @@ pub fn request_body(request: &AnthropicRequest<'_>) -> Value {
     body
 }
 
-/// Effort levels of adaptive thinking (`output_config.effort`).
-pub const ADAPTIVE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
-
-/// True for Claude models that take adaptive thinking instead of a thinking
-/// budget: Fable and Mythos, and Opus/Sonnet from 4.6 on. Haiku and older
-/// Opus/Sonnet keep `budget_tokens`.
-pub fn uses_adaptive_thinking(model: &str) -> bool {
-    let name = model.rsplit('/').next().unwrap_or(model);
-    let Some(rest) = name.strip_prefix("claude-") else {
-        return false;
-    };
-    if rest.starts_with("fable") || rest.starts_with("mythos") {
-        return true;
-    }
-    let version = match rest.split_once('-') {
 /// Prompt-cache breakpoint on the last block of the conversation, so each
 /// request writes the cache the next one reads (the system prompt carries the
 /// other breakpoint). Some gateways cache only marked prompts. Thinking blocks
@@ -129,6 +129,21 @@ fn mark_cache_breakpoint(messages: &mut [Value]) {
     }
 }
 
+/// Effort levels of adaptive thinking (`output_config.effort`).
+pub const ADAPTIVE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// True for Claude models that take adaptive thinking instead of a thinking
+/// budget: Fable and Mythos, and Opus/Sonnet from 4.6 on. Haiku and older
+/// Opus/Sonnet keep `budget_tokens`.
+pub fn uses_adaptive_thinking(model: &str) -> bool {
+    let name = model.rsplit('/').next().unwrap_or(model);
+    let Some(rest) = name.strip_prefix("claude-") else {
+        return false;
+    };
+    if rest.starts_with("fable") || rest.starts_with("mythos") {
+        return true;
+    }
+    let version = match rest.split_once('-') {
         Some(("opus" | "sonnet", version)) => version,
         _ => return false,
     };
@@ -944,6 +959,19 @@ mod tests {
         // 20k would exceed max_tokens, so the budget is capped below it.
         assert_eq!(body["thinking"]["budget_tokens"], 7_168);
         assert_eq!(body["messages"][0]["role"], "user");
+    }
+
+    #[test]
+    fn unknown_output_cap_sends_the_required_default() {
+        let body = request_body(&AnthropicRequest {
+            model: "claude-opus-5-5",
+            system_prompt: "",
+            input: &[],
+            tools: &[],
+            max_output_tokens: 0,
+            reasoning_effort: "none",
+        });
+        assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS);
     }
 
     #[test]

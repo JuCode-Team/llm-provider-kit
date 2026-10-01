@@ -49,7 +49,7 @@ pub fn request_body(request: ResponsesRequest<'_>) -> Value {
     } else {
         json!({ "effort": request.reasoning_effort, "summary": "auto" })
     };
-    json!({
+    let mut body = json!({
         "model": request.model,
         "instructions": request.instructions,
         "prompt_cache_key": request.prompt_cache_key,
@@ -58,11 +58,20 @@ pub fn request_body(request: ResponsesRequest<'_>) -> Value {
         "tools": request.tools,
         "tool_choice": "auto",
         "parallel_tool_calls": true,
-        "max_output_tokens": request.max_output_tokens.max(1),
         "store": false,
         "include": ["reasoning.encrypted_content"],
         "stream": true
-    })
+    });
+    set_max_output_tokens(&mut body, request.max_output_tokens);
+    body
+}
+
+/// `max_output_tokens` is optional on the Responses API: an unknown cap (0)
+/// is left to the model's own limit instead of sending a guess.
+fn set_max_output_tokens(body: &mut Value, max_output_tokens: u64) {
+    if max_output_tokens > 0 {
+        body["max_output_tokens"] = json!(max_output_tokens);
+    }
 }
 
 /// Body for a one-shot call (summarization, safety classification): no tools,
@@ -74,15 +83,16 @@ pub fn one_shot_body(
     user: &str,
     max_output_tokens: u64,
 ) -> Value {
-    json!({
+    let mut body = json!({
         "model": model,
         "instructions": instructions,
         "reasoning": { "effort": reasoning_effort },
-        "max_output_tokens": max_output_tokens.max(1),
         "input": [{ "role": "user", "content": [{ "type": "input_text", "text": user }] }],
         "store": false,
         "stream": true
-    })
+    });
+    set_max_output_tokens(&mut body, max_output_tokens);
+    body
 }
 
 /// `chatgpt-account-id` for the Codex backend: the ChatGPT workspace the token
@@ -532,6 +542,21 @@ mod tests {
         assert_eq!(sanitized.len(), 1);
         assert!(sanitized[0].get("is_error").is_none());
         assert_eq!(sanitized[0]["output"], "boom");
+    }
+
+    #[test]
+    fn unknown_output_cap_is_omitted() {
+        let body = request_body(ResponsesRequest {
+            model: "gpt-6-sol",
+            instructions: "system",
+            prompt_cache_key: "cache-key",
+            reasoning_effort: "none",
+            input: Vec::new(),
+            tools: &[],
+            max_output_tokens: 0,
+        });
+        assert!(body.get("max_output_tokens").is_none());
+        assert!(one_shot_body("m", "i", "low", "u", 0).get("max_output_tokens").is_none());
     }
 
     #[test]

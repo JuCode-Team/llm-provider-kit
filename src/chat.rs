@@ -34,10 +34,13 @@ pub fn request_body(request: &ChatRequest<'_>) -> Value {
     let mut body = json!({
         "model": request.model,
         "messages": messages_from_input(request.system_prompt, request.input),
-        "max_tokens": request.max_output_tokens.max(1),
         "stream": true,
         "stream_options": { "include_usage": true }
     });
+    // Optional on Chat Completions: an unknown cap (0) is left to the model.
+    if request.max_output_tokens > 0 {
+        body["max_tokens"] = json!(request.max_output_tokens);
+    }
     let tools = tools_from_definitions(request.tools);
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
