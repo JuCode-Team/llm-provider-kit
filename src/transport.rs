@@ -31,8 +31,14 @@ const AZURE_DEFAULT_API_VERSION: &str = "v1";
 pub enum StreamEvent {
     /// The request was accepted (after any retries).
     Connected,
-    /// The request is being re-sent; `attempt` is the next attempt number.
-    Retrying { attempt: usize },
+    /// The request failed with `reason` and is re-sent after `delay_ms`;
+    /// `attempt` is the next attempt number, of `max_attempts`.
+    Retrying {
+        attempt: usize,
+        max_attempts: usize,
+        reason: String,
+        delay_ms: u64,
+    },
     /// A decoded protocol event.
     Wire(WireEvent),
 }
@@ -192,9 +198,7 @@ impl Client {
             match self.send(protocol, url, body, read_timeout) {
                 Ok(response) => return Ok(response),
                 Err(error) if attempt < max_attempts && error.is_retryable() => {
-                    emit(StreamEvent::Retrying {
-                        attempt: attempt + 1,
-                    })?;
+                    emit(retrying(attempt, max_attempts, &error.message))?;
                     thread::sleep(retry_backoff(attempt));
                 }
                 Err(error) => return Err(error.message),
@@ -221,9 +225,7 @@ impl Client {
             let response = match self.send(protocol, url, body, read_timeout) {
                 Ok(response) => response,
                 Err(error) if attempt < max_attempts && error.is_retryable() => {
-                    emit(StreamEvent::Retrying {
-                        attempt: attempt + 1,
-                    })?;
+                    emit(retrying(attempt, max_attempts, &error.message))?;
                     thread::sleep(retry_backoff(attempt));
                     continue;
                 }
@@ -275,9 +277,7 @@ impl Client {
                     return Ok(output_items);
                 }
                 Err(error) if attempt < max_attempts && is_retryable_stream_error(&error) => {
-                    emit(StreamEvent::Retrying {
-                        attempt: attempt + 1,
-                    })?;
+                    emit(retrying(attempt, max_attempts, &error))?;
                     thread::sleep(retry_backoff(attempt));
                 }
                 Err(error) => return Err(error),
@@ -433,6 +433,16 @@ fn capture_turn_state(response: &ureq::Response, turn_state: &OnceLock<String>) 
         true
     } else {
         false
+    }
+}
+
+/// The notice for re-sending after failed attempt `attempt`.
+fn retrying(attempt: usize, max_attempts: usize, reason: &str) -> StreamEvent {
+    StreamEvent::Retrying {
+        attempt: attempt + 1,
+        max_attempts,
+        reason: reason.to_string(),
+        delay_ms: retry_backoff(attempt).as_millis() as u64,
     }
 }
 
@@ -712,8 +722,15 @@ mod tests {
                 Duration::from_secs(2),
                 &mut |event| {
                     match event {
-                        StreamEvent::Retrying { attempt } => {
-                            assert_eq!(attempt, 2);
+                        StreamEvent::Retrying {
+                            attempt,
+                            max_attempts,
+                            reason,
+                            delay_ms,
+                        } => {
+                            assert_eq!((attempt, max_attempts), (2, 2));
+                            assert!(!reason.is_empty());
+                            assert!(delay_ms > 0);
                             retries += 1;
                         }
                         StreamEvent::Wire(WireEvent::Delta(delta)) => deltas.push(delta),
