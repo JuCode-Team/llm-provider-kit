@@ -66,8 +66,7 @@ pub fn request_body(request: &AnthropicRequest<'_>) -> Value {
     let thinking_budget = if adaptive {
         None
     } else {
-        thinking_budget(effort)
-            .map(|budget| budget.min(max_tokens.saturating_sub(1024).max(1024)))
+        thinking_budget(effort).map(|budget| budget.min(max_tokens.saturating_sub(1024).max(1024)))
     };
     let thinks = if adaptive {
         ADAPTIVE_EFFORTS.contains(&effort)

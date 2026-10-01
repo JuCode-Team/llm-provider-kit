@@ -556,7 +556,9 @@ mod tests {
             max_output_tokens: 0,
         });
         assert!(body.get("max_output_tokens").is_none());
-        assert!(one_shot_body("m", "i", "low", "u", 0).get("max_output_tokens").is_none());
+        assert!(one_shot_body("m", "i", "low", "u", 0)
+            .get("max_output_tokens")
+            .is_none());
     }
 
     #[test]
