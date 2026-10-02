@@ -16,8 +16,13 @@ use std::{
     time::Duration,
 };
 
-const RETRY_BACKOFF_BASE_MS: u64 = 250;
-const RETRY_BACKOFF_MAX_MS: u64 = 4_000;
+// Codex's schedule (doubling from a base, ±10% jitter), from a larger base:
+// 1, 2, 4, 8, 16 s over the five default retries, so a short outage passes
+// before the attempts run out.
+const RETRY_BACKOFF_BASE_MS: u64 = 1_000;
+const RETRY_BACKOFF_MAX_MS: u64 = 30_000;
+/// The longest a server's Retry-After is honored.
+const RETRY_AFTER_MAX_MS: u64 = 60_000;
 /// Prompt-cache stickiness header the Codex backend returns.
 const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 /// The Codex backend version-gates model availability on this value.
@@ -49,6 +54,8 @@ pub enum StreamEvent {
 pub struct RequestError {
     pub status: Option<u16>,
     pub message: String,
+    /// The server's Retry-After, when it sent one.
+    pub retry_after: Option<Duration>,
 }
 
 impl std::fmt::Display for RequestError {
@@ -63,6 +70,14 @@ impl RequestError {
     /// Retry on transport failures, 429 rate limits, and 5xx responses. Other
     /// 4xx responses are client errors and are never retried.
     pub fn is_retryable(&self) -> bool {
+        // A server that asks for a longer wait than is honored (a usage
+        // window resetting in hours) is answered at once, not waited on.
+        if self
+            .retry_after
+            .is_some_and(|after| after > Duration::from_millis(RETRY_AFTER_MAX_MS))
+        {
+            return false;
+        }
         match self.status {
             Some(code) => code == 429 || code >= 500,
             None => true,
@@ -198,8 +213,13 @@ impl Client {
             match self.send(protocol, url, body, read_timeout) {
                 Ok(response) => return Ok(response),
                 Err(error) if attempt < max_attempts && error.is_retryable() => {
-                    emit(retrying(attempt, max_attempts, &error.message))?;
-                    thread::sleep(retry_backoff(attempt));
+                    wait_to_retry(
+                        attempt,
+                        max_attempts,
+                        &error.message,
+                        error.retry_after,
+                        emit,
+                    )?;
                 }
                 Err(error) => return Err(error.message),
             }
@@ -225,8 +245,13 @@ impl Client {
             let response = match self.send(protocol, url, body, read_timeout) {
                 Ok(response) => response,
                 Err(error) if attempt < max_attempts && error.is_retryable() => {
-                    emit(retrying(attempt, max_attempts, &error.message))?;
-                    thread::sleep(retry_backoff(attempt));
+                    wait_to_retry(
+                        attempt,
+                        max_attempts,
+                        &error.message,
+                        error.retry_after,
+                        emit,
+                    )?;
                     continue;
                 }
                 Err(error) => return Err(error.message),
@@ -236,14 +261,34 @@ impl Client {
                 .header("content-type")
                 .unwrap_or_default()
                 .to_string();
+            // The connection can drop while a body is read like any stream.
+            let body = |response: ureq::Response| {
+                response
+                    .into_string()
+                    .map_err(|error| format!("io error: {error}"))
+            };
             if !content_type.contains("text/event-stream")
                 && !content_type.contains("application/json")
             {
-                let body = response.into_string().map_err(|error| error.to_string())?;
+                let body = match body(response) {
+                    Ok(body) => body,
+                    Err(error) if attempt < max_attempts => {
+                        wait_to_retry(attempt, max_attempts, &error, None, emit)?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 return Err(non_json_response_error(protocol, url, &content_type, &body));
             }
             if content_type.contains("application/json") {
-                let body = response.into_string().map_err(|error| error.to_string())?;
+                let body = match body(response) {
+                    Ok(body) => body,
+                    Err(error) if attempt < max_attempts => {
+                        wait_to_retry(attempt, max_attempts, &error, None, emit)?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 let value =
                     serde_json::from_str::<Value>(&body).map_err(|error| error.to_string())?;
                 let (output_items, usage) = json_items(protocol, &value);
@@ -277,8 +322,7 @@ impl Client {
                     return Ok(output_items);
                 }
                 Err(error) if attempt < max_attempts && is_retryable_stream_error(&error) => {
-                    emit(retrying(attempt, max_attempts, &error))?;
-                    thread::sleep(retry_backoff(attempt));
+                    wait_to_retry(attempt, max_attempts, &error, None, emit)?;
                 }
                 Err(error) => return Err(error),
             }
@@ -436,19 +480,50 @@ fn capture_turn_state(response: &ureq::Response, turn_state: &OnceLock<String>) 
     }
 }
 
-/// The notice for re-sending after failed attempt `attempt`.
-fn retrying(attempt: usize, max_attempts: usize, reason: &str) -> StreamEvent {
-    StreamEvent::Retrying {
+/// Announces the next attempt after failed attempt `attempt` and waits for
+/// it: the backoff, or the server's Retry-After when that is longer.
+fn wait_to_retry(
+    attempt: usize,
+    max_attempts: usize,
+    reason: &str,
+    retry_after: Option<Duration>,
+    emit: &mut impl FnMut(StreamEvent) -> Result<(), String>,
+) -> Result<(), String> {
+    let delay = retry_delay(attempt, retry_after, jitter());
+    emit(StreamEvent::Retrying {
         attempt: attempt + 1,
         max_attempts,
         reason: reason.to_string(),
-        delay_ms: retry_backoff(attempt).as_millis() as u64,
-    }
+        delay_ms: delay.as_millis() as u64,
+    })?;
+    thread::sleep(delay);
+    Ok(())
 }
 
-fn retry_backoff(attempt: usize) -> Duration {
-    let multiplier = 1u64 << attempt.saturating_sub(1).min(4);
-    Duration::from_millis((RETRY_BACKOFF_BASE_MS * multiplier).min(RETRY_BACKOFF_MAX_MS))
+/// A factor in [0.9, 1.1).
+fn jitter() -> f64 {
+    let mut bytes = [0u8; 2];
+    let _ = getrandom::getrandom(&mut bytes);
+    0.9 + f64::from(u16::from_le_bytes(bytes)) / f64::from(u16::MAX) * 0.2
+}
+
+fn retry_delay(attempt: usize, retry_after: Option<Duration>, jitter: f64) -> Duration {
+    let multiplier = 1u64 << attempt.saturating_sub(1).min(10);
+    let backoff = (RETRY_BACKOFF_BASE_MS * multiplier).min(RETRY_BACKOFF_MAX_MS) as f64 * jitter;
+    let backoff = Duration::from_millis(backoff as u64);
+    let server = retry_after.map_or(Duration::ZERO, |after| {
+        after.min(Duration::from_millis(RETRY_AFTER_MAX_MS))
+    });
+    backoff.max(server)
+}
+
+/// Retry-After in seconds (the HTTP-date form is not used by LLM APIs).
+fn retry_after(response: &ureq::Response) -> Option<Duration> {
+    response
+        .header("retry-after")
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .map(|seconds| Duration::from_secs_f64(seconds.min(86_400.0)))
 }
 
 fn truncate_error_body(body: &str) -> String {
@@ -465,17 +540,20 @@ fn truncate_error_body(body: &str) -> String {
 fn map_ureq_error(error: ureq::Error) -> RequestError {
     match error {
         ureq::Error::Status(code, response) => {
+            let retry_after = retry_after(&response);
             let body = response
                 .into_string()
                 .unwrap_or_else(|_| "<failed to read error body>".to_string());
             RequestError {
                 status: Some(code),
                 message: format!("LLM API returned HTTP {code}: {body}"),
+                retry_after,
             }
         }
         error => RequestError {
             status: None,
             message: error.to_string(),
+            retry_after: None,
         },
     }
 }
@@ -510,45 +588,48 @@ fn is_stream_decode_error(message: &str) -> bool {
 }
 
 fn is_retryable_stream_error(message: &str) -> bool {
-    is_stream_decode_error(message)
-        || is_retryable_response_failed(message)
-        || is_retryable_anthropic_error(message)
+    is_stream_decode_error(message) || is_retryable_error_event(message)
 }
 
-/// Anthropic in-stream `error` events for transient conditions are safe to
-/// re-send; other error types (invalid_request, authentication, ...) are not.
-fn is_retryable_anthropic_error(message: &str) -> bool {
+/// HTTP statuses worth another attempt. In-stream error codes are not all
+/// HTTP statuses (GLM sends 1301 for a content filter), so only these.
+fn transient_status(code: u64) -> bool {
+    code == 429 || (500..600).contains(&code)
+}
+
+/// In-stream error events for transient server conditions are safe to
+/// re-send; others (invalid request, authentication, quota, ...) are not.
+/// Covers Anthropic `error` events, Responses `error` / `response.failed`
+/// events and Chat Completions `{"error": ...}` chunks.
+fn is_retryable_error_event(message: &str) -> bool {
     let Ok(value) = serde_json::from_str::<Value>(message) else {
         return false;
     };
-    if value.get("type").and_then(Value::as_str) != Some("error") {
-        return false;
-    }
-    let kind = value
-        .get("error")
-        .and_then(|error| error.get("type"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    matches!(kind, "overloaded_error" | "api_error")
-}
-
-fn is_retryable_response_failed(message: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<Value>(message) else {
-        return false;
+    let error = value
+        .pointer("/response/error")
+        .or_else(|| value.get("error"))
+        .unwrap_or(&value);
+    let transient = |field: &Value| match field {
+        Value::String(text) => {
+            matches!(
+                text.as_str(),
+                "server_error"
+                    | "internal_error"
+                    | "rate_limit_exceeded"
+                    | "overloaded_error"
+                    | "api_error"
+                    | "overloaded"
+                    | "service_unavailable"
+                    | "server_is_overloaded"
+            ) || text.parse::<u64>().is_ok_and(transient_status)
+        }
+        Value::Number(code) => code.as_u64().is_some_and(transient_status),
+        _ => false,
     };
-    if value.get("type").and_then(Value::as_str) != Some("response.failed") {
-        return false;
-    }
-    let code = value
-        .get("response")
-        .and_then(|response| response.get("error"))
-        .and_then(|error| error.get("code"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    matches!(
-        code,
-        "server_error" | "rate_limit_exceeded" | "internal_error"
-    )
+    ["code", "type", "status"]
+        .iter()
+        .filter_map(|key| error.get(*key))
+        .any(transient)
 }
 
 #[cfg(test)]
@@ -802,6 +883,7 @@ mod tests {
         let error = |status| RequestError {
             status,
             message: String::new(),
+            retry_after: None,
         };
         assert!(error(Some(500)).is_retryable());
         assert!(error(Some(429)).is_retryable());
@@ -816,15 +898,53 @@ mod tests {
         assert!(is_retryable_stream_error(
             "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}"
         ));
+        assert!(!is_retryable_stream_error(
+            "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\"}}"
+        ));
+        // Responses `error` events and Chat Completions error chunks.
+        assert!(is_retryable_stream_error(
+            "{\"type\":\"error\",\"code\":\"server_error\",\"message\":\"x\"}"
+        ));
+        assert!(is_retryable_stream_error(
+            "{\"error\":{\"code\":502,\"message\":\"bad gateway\"}}"
+        ));
+        assert!(!is_retryable_stream_error(
+            "{\"error\":{\"code\":\"insufficient_quota\",\"type\":\"insufficient_quota\"}}"
+        ));
+        assert!(!is_retryable_stream_error(
+            "{\"error\":{\"code\":\"1301\",\"message\":\"filtered\"}}"
+        ));
+        // A usage window resetting in hours: report it, do not wait on it.
+        let limited = RequestError {
+            status: Some(429),
+            message: String::new(),
+            retry_after: Some(Duration::from_secs(3 * 3600)),
+        };
+        assert!(!limited.is_retryable());
+        // A connection dropped while the stream is read.
+        assert!(is_retryable_stream_error(
+            "io error: Software caused connection abort (os error 53)"
+        ));
     }
 
     #[test]
-    fn retry_backoff_increases_and_caps() {
-        assert_eq!(retry_backoff(1), Duration::from_millis(250));
-        assert_eq!(retry_backoff(2), Duration::from_millis(500));
-        assert_eq!(retry_backoff(3), Duration::from_millis(1000));
-        assert_eq!(retry_backoff(5), Duration::from_millis(4000));
-        assert_eq!(retry_backoff(99), Duration::from_millis(4000));
+    fn retry_backoff_doubles_caps_and_yields_to_retry_after() {
+        let delay = |attempt, after| retry_delay(attempt, after, 1.0);
+        assert_eq!(delay(1, None), Duration::from_secs(1));
+        assert_eq!(delay(2, None), Duration::from_secs(2));
+        assert_eq!(delay(5, None), Duration::from_secs(16));
+        assert_eq!(delay(99, None), Duration::from_secs(30));
+        assert_eq!(retry_delay(1, None, 0.9), Duration::from_millis(900));
+        assert_eq!(
+            delay(1, Some(Duration::from_secs(20))),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            delay(1, Some(Duration::from_secs(600))),
+            Duration::from_secs(60)
+        );
+        let j = jitter();
+        assert!((0.9..=1.1).contains(&j));
     }
 
     #[test]

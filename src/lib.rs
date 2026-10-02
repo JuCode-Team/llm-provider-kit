@@ -162,7 +162,8 @@ pub(crate) fn read_sse_data(
     use std::io::BufRead;
 
     for line in reader.lines() {
-        let line = line.map_err(|error| error.to_string())?;
+        // Tagged so the caller retries it like any dropped connection.
+        let line = line.map_err(|error| format!("io error: {error}"))?;
         if let Some(data) = line.strip_prefix("data:") {
             data_lines.push(data.trim_start().to_string());
             continue;
